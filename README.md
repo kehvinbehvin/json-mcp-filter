@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/kehvinbehvin-json-mcp-filter-badge.png)](https://mseep.ai/app/kehvinbehvin-json-mcp-filter)
+
 # JSON MCP Filter
 
 A powerful Model Context Protocol (MCP) server that provides JSON schema generation and filtering tools for local files and remote HTTP/HTTPS endpoints. Built with [quicktype](https://github.com/quicktype/quicktype) for robust TypeScript type generation.
