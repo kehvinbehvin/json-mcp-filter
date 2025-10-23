@@ -29,7 +29,7 @@ const JsonFilterInputSchema = z.object({
     "Must be a valid file path or HTTP/HTTPS URL"
   ),
   shape: z.any().describe("Shape object defining what to extract"),
-  chunkIndex: z.number().int().min(0).optional().describe("Index of chunk to retrieve (0-based)")
+  cursor: z.string().optional().describe("Opaque cursor token for pagination. Omit to start from the beginning.")
 });
 
 const JsonDryRunInputSchema = z.object({
@@ -65,10 +65,7 @@ type JsonSchemaResult = {
 type JsonFilterResult = {
   readonly success: true;
   readonly filteredData: any;
-  readonly chunkInfo?: {
-    readonly chunkIndex: number;
-    readonly totalChunks: number;
-  };
+  readonly nextCursor?: string;
 } | {
   readonly success: false;
   readonly error: JsonSchemaError;
@@ -88,7 +85,7 @@ type JsonDryRunResult = {
 // Create server instance
 const server = new McpServer({
   name: "json-mcp",
-  version: "1.0.1",
+  version: "1.2.0",
   capabilities: {
     resources: {},
     tools: {},
@@ -97,6 +94,45 @@ const server = new McpServer({
 
 // Initialize the JSON ingestion context (Phase 1: LocalFileStrategy only)
 const jsonIngestionContext = new JsonIngestionContext();
+
+/**
+ * Pagination cursor interface for MCP-compliant cursor-based pagination
+ */
+interface PaginationCursor {
+  readonly offset: number;
+  readonly pageSize: number;
+  readonly totalSize: number;
+}
+
+/**
+ * Encode pagination state into an opaque cursor token (base64-encoded JSON)
+ */
+function encodeCursor(cursor: PaginationCursor): string {
+  const jsonString = JSON.stringify(cursor);
+  return Buffer.from(jsonString).toString('base64');
+}
+
+/**
+ * Decode an opaque cursor token back into pagination state
+ * Returns null if the cursor is invalid
+ */
+function decodeCursor(cursorToken: string): PaginationCursor | null {
+  try {
+    const jsonString = Buffer.from(cursorToken, 'base64').toString('utf-8');
+    const cursor = JSON.parse(jsonString) as PaginationCursor;
+
+    // Validate cursor structure
+    if (typeof cursor.offset !== 'number' ||
+        typeof cursor.pageSize !== 'number' ||
+        typeof cursor.totalSize !== 'number') {
+      return null;
+    }
+
+    return cursor;
+  } catch {
+    return null;
+  }
+}
 
 async function quicktypeJSON(
   targetLanguage: LanguageName, 
@@ -356,54 +392,91 @@ async function processJsonFilter(input: JsonFilterInput): Promise<JsonFilterResu
     // Apply shape filter
     try {
       const filteredData = extractWithShape(parsedData, input.shape);
-      
+
       // Convert filtered data to JSON string to check size
       const filteredJson = JSON.stringify(filteredData, null, 2);
       const filteredSize = new TextEncoder().encode(filteredJson).length;
-      
-      // Define chunking threshold (400KB)
-      const CHUNK_THRESHOLD = 400 * 1024;
-      
-      // If under threshold, return all data
-      if (filteredSize <= CHUNK_THRESHOLD) {
+
+      // Define page size (400KB per page)
+      const PAGE_SIZE = 400 * 1024;
+
+      // If under page size, return all data without pagination
+      if (filteredSize <= PAGE_SIZE) {
         return {
           success: true,
           filteredData
         };
       }
-      
-      // Calculate total chunks needed
-      const totalChunks = Math.ceil(filteredSize / CHUNK_THRESHOLD);
-      const chunkIndex = input.chunkIndex ?? 0; // Default to 0
-      
-      // Validate chunk index
-      if (chunkIndex >= totalChunks || chunkIndex < 0) {
+
+      // Decode cursor to get pagination state, or start from beginning
+      let offset = 0;
+      if (input.cursor) {
+        const decodedCursor = decodeCursor(input.cursor);
+        if (!decodedCursor) {
+          return {
+            success: false,
+            error: {
+              type: 'validation_error',
+              message: 'Invalid cursor token provided',
+              details: { cursor: input.cursor }
+            }
+          };
+        }
+
+        // Validate cursor totalSize matches current data
+        if (decodedCursor.totalSize !== filteredSize) {
+          return {
+            success: false,
+            error: {
+              type: 'validation_error',
+              message: 'Cursor is stale - data has changed since cursor was created',
+              details: {
+                expectedSize: decodedCursor.totalSize,
+                actualSize: filteredSize
+              }
+            }
+          };
+        }
+
+        offset = decodedCursor.offset;
+      }
+
+      // Validate offset is within bounds
+      if (offset >= filteredSize || offset < 0) {
         return {
           success: false,
           error: {
             type: 'validation_error',
-            message: `Invalid chunkIndex ${chunkIndex}. Must be between 0 and ${totalChunks - 1}`,
-            details: { chunkIndex, totalChunks }
+            message: `Invalid offset ${offset}. Must be between 0 and ${filteredSize - 1}`,
+            details: { offset, totalSize: filteredSize }
           }
         };
       }
-      
-      // Line-based chunking
-      const lines = filteredJson.split('\n');
-      const linesPerChunk = Math.ceil(lines.length / totalChunks);
-      const startLine = chunkIndex * linesPerChunk;
-      const endLine = Math.min(startLine + linesPerChunk, lines.length);
-      
-      // Extract chunk as text
-      const chunkText = lines.slice(startLine, endLine).join('\n');
-      
+
+      // Calculate byte-range for this page
+      const endOffset = Math.min(offset + PAGE_SIZE, filteredSize);
+
+      // Extract the page content using byte offsets
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const fullBytes = encoder.encode(filteredJson);
+      const pageBytes = fullBytes.slice(offset, endOffset);
+      const pageText = decoder.decode(pageBytes);
+
+      // Calculate next cursor if there's more data
+      let nextCursor: string | undefined;
+      if (endOffset < filteredSize) {
+        nextCursor = encodeCursor({
+          offset: endOffset,
+          pageSize: PAGE_SIZE,
+          totalSize: filteredSize
+        });
+      }
+
       return {
         success: true,
-        filteredData: chunkText, // Return as string when chunking
-        chunkInfo: {
-          chunkIndex,
-          totalChunks
-        }
+        filteredData: pageText,
+        nextCursor
       };
     } catch (error) {
       return {
@@ -562,7 +635,7 @@ server.tool(
 
 server.tool(
     "json_filter",
-    "Filter JSON data using a shape object to extract only the fields you want. Provide filePath (local file or HTTP/HTTPS URL) and shape parameters.",
+    "Filter JSON data using a shape object to extract only the fields you want. Uses cursor-based pagination for large results (>400KB). Provide filePath (local file or HTTP/HTTPS URL) and shape parameters.",
     {
         filePath: z.string().describe("Path to the JSON file (local) or HTTP/HTTPS URL to filter"),
         shape: z.unknown().describe(`Shape object (formatted as valid JSON) defining what fields to extract. Use 'true' to include a field, or nested objects for deep extraction.
@@ -591,14 +664,15 @@ Examples:
    }
 }
 
-Note: 
+Note:
 - Arrays are automatically handled - the shape is applied to each item in the array.
 - Use json_schema tool to analyse the JSON file schema before using this tool.
 - Use json_dry_run tool to get a size breakdown of your desired json shape before using this tool.
+- For large results (>400KB), the response will include a nextCursor for pagination. Pass this cursor back to retrieve the next page.
 `),
-        chunkIndex: z.number().optional().describe("Index of chunk to retrieve (0-based). If filtered data exceeds 400KB, it will be automatically chunked. Defaults to 0 if not specified.")
+        cursor: z.string().optional().describe("Opaque pagination cursor. Omit for the first request. If the response includes a nextCursor, pass it here to retrieve the next page.")
     },
-    async ({ filePath, shape, chunkIndex }) => {
+    async ({ filePath, shape, cursor }) => {
         try {
             // If shape is a string, parse it as JSON
             let parsedShape = shape;
@@ -623,29 +697,43 @@ Note:
             const validatedInput = JsonFilterInputSchema.parse({
                 filePath,
                 shape: parsedShape,
-                chunkIndex
+                cursor
             });
-            
+
             const result = await processJsonFilter(validatedInput);
-            
+
             if (result.success) {
-                // Check if chunking is active
-                if (result.chunkInfo) {
-                    // Return chunk data + metadata as separate content items
+                // Check if pagination is active
+                if (result.nextCursor) {
+                    // Return paginated data with nextCursor
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: result.filteredData // This is already a string when chunking
+                                text: result.filteredData // This is already a string when paginated
                             },
                             {
                                 type: "text",
-                                text: JSON.stringify(result.chunkInfo)
+                                text: `\n---\nPagination: More data available. Use cursor: ${result.nextCursor}`
+                            }
+                        ]
+                    };
+                } else if (typeof result.filteredData === 'string') {
+                    // Last page of paginated data (no more cursor)
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: result.filteredData
+                            },
+                            {
+                                type: "text",
+                                text: "\n---\nPagination: End of data"
                             }
                         ]
                     };
                 } else {
-                    // No chunking - return as normal JSON
+                    // No pagination - return as normal JSON
                     return {
                         content: [
                             {
