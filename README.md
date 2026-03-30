@@ -254,3 +254,8 @@ src/
 2. `json_filter` extracts relevant fields
 3. Process clean data without noise
 4. `json_schema` generates types for safety
+
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/kehvinbehvin-json-mcp-filter).
+
