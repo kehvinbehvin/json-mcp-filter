@@ -4,6 +4,7 @@
 
 A powerful Model Context Protocol (MCP) server that provides JSON schema generation and filtering tools for local files and remote HTTP/HTTPS endpoints. Built with [quicktype](https://github.com/quicktype/quicktype) for robust TypeScript type generation.
 
+[![Trust Score](https://archestra.ai/mcp-catalog/api/badge/quality/kehvinbehvin/json-mcp-filter)](https://archestra.ai/mcp-catalog/kehvinbehvin__json-mcp-filter)
 <a href="https://glama.ai/mcp/servers/@kehvinbehvin/json-mcp">
   <img width="380" height="200" src="https://glama.ai/mcp/servers/@kehvinbehvin/json-mcp/badge" alt="JSON Server MCP server" />
 
